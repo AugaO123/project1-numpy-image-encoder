@@ -1,0 +1,105 @@
+% !TeX program = xelatex
+\documentclass[a4paper,11pt]{article}
+\usepackage{fontspec,xeCJK,geometry,graphicx,xcolor,booktabs,fancyhdr,fvextra,hyperref}
+\setCJKmainfont{FandolSong-Regular}
+\geometry{left=20mm,right=20mm,top=18mm,bottom=18mm}
+\definecolor{navy}{HTML}{173C61}
+\hypersetup{colorlinks=true,urlcolor=navy}
+\pagestyle{fancy}\fancyhf{}\fancyhead[L]{\small Python Programming / Project 1}\fancyhead[R]{\small 2025221025}\fancyfoot[C]{\thepage}
+\setlength{\parindent}{0pt}\setlength{\parskip}{6pt}
+\begin{document}
+\begin{titlepage}\centering
+\vspace*{25mm}{\Huge\bfseries 深\ 圳\ 大\ 学\ 实\ 验\ 报\ 告}\\[22mm]
+{\Large 课程名称\quad\underline{\makebox[85mm][c]{Python程序设计}}}\\[9mm]
+{\Large 项目名称\quad\underline{\makebox[85mm][c]{NumPy 图像编码器}}}\\[9mm]
+{\Large 学 院\quad\underline{\makebox[85mm][c]{人工智能学院}}}\\[9mm]
+{\Large 指导教师\quad\underline{\makebox[85mm][c]{樊超}}}\\[9mm]
+{\Large 报 告 人\quad\underline{\makebox[85mm][c]{金佳圆}}}\\[9mm]
+{\Large 学 号\quad\underline{\makebox[85mm][c]{2025221025}}}\\[9mm]
+{\Large 实验时间\quad\underline{\makebox[85mm][c]{2026.11.19}}}\\[9mm]
+{\Large 提交时间\quad\underline{\makebox[85mm][c]{2026.11.22}}}\\[9mm]
+\vfill{\Large 教务处制}\end{titlepage}
+\section*{1 Objectives and Overview}
+The goal is to reproduce the supplied OpenCLIP ViT-B/32 image encoder using NumPy. Given fixed learned visual parameters, the encoder maps preprocessed RGB images to normalized 512-dimensional feature vectors. The task is forward inference: no training, loss function, gradient calculation, or parameter update is required.
+
+\subsection*{1.1 Input, architecture and output contract}
+The input is float32 [B,3,224,224], where B is the number of images. A 32$\times$32 patch size produces a 7$\times$7 grid, hence 49 patch rows. The learned CLS token increases the sequence length to 50. Twelve Transformer blocks preserve [B,50,768]; the final head selects CLS and returns [B,512]. Each output row has unit Euclidean length.
+
+\begin{center}\includegraphics[width=\linewidth,height=84.7mm,keepaspectratio]{figures/01_pipeline.pdf}\\{\footnotesize Figure 1. Image-encoder data flow. Red boxes identify the six implemented TODO groups; neutral boxes show supplied operations.}\end{center}
+\subsection*{1.2 Scope and implementation boundaries}
+<font color="\#BB313F">\textbf{Implemented:}</font> patchification, head splitting, attention calculation and merging, both residual additions, the MLP, embedding, and CLS output projection. The supplied preprocessing, LayerNorm, exact GELU, attention-weight conversion and unit-vector helpers remain in use. Weight names, tensor values and public class interfaces are preserved.
+
+The course configuration fixes width=768, heads=12, head\_dim=64, MLP width=3072 and output\_dim=512. Changing configuration values alone cannot produce a different valid checkpoint. The reference archive is used only by check.py; the encoder never reads cached reference rows.
+
+
+\newpage
+\section*{2 Implementations: patches and array organization}
+The first challenge is preserving element order while changing shape. Reshape groups existing elements; transpose reorders axes. Matching only the final shape is insufficient because an incorrect patch or head order changes every later calculation.
+
+\begin{center}\includegraphics[width=\linewidth,height=68.1mm,keepaspectratio]{figures/02_axes.pdf}\\{\footnotesize Figure 2. Two assessed axis transformations. Batch B is preserved; N denotes token count and is 50 in the image tower.}\end{center}
+\subsection*{2.1 Patchify and embedding (TODO-01 / TODO-05)}
+For each image, separate height and width into grid and within-patch axes: [B,3,7,32,7,32]. Reorder to [B,7,7,3,32,32] before flattening. Patches are visited left to right, then top to bottom; inside each patch the flattening order is C,H,W. Each row has 3$\times$32$\times$32=3072 elements.
+
+\begin{Verbatim}[fontsize=\footnotesize,breaklines=true,frame=single]
+patches = images.reshape(B,3,7,32,7,32)
+patches = patches.transpose(0,2,4,1,3,5).reshape(B,49,3072)
+patch_tokens = patches @ self.patch_weight.T
+tokens = np.concatenate([cls, patch_tokens], axis=1)
+return tokens + self.position
+\end{Verbatim}
+The patch projection has no bias and maps 3072 features to 768. CLS is repeated once per image and prepended along axis 1. The position array [50,768] broadcasts across B, assigning a learned position to CLS and each patch. The supplied pre-Norm then prepares the sequence for the first block.
+
+\subsection*{2.2 Split heads and transpose K (TODO-02)}
+Each Q, K and V tensor [B,N,768] is reshaped to [B,N,12,64], then transposed to [B,12,N,64]. The last axis carries head features. For query-key comparisons, only K’s final two axes are swapped: k.swapaxes(-1,-2). Using k.T on a four-dimensional array would reverse all axes and mix the batch/head organization.
+
+<font color="\#BB313F">\textbf{Shape invariant:}</font> Q @ K$^{T}$ yields [B,12,N,N]. Each row compares one query token with all N key tokens within the same image and attention head.
+
+
+\newpage
+\section*{3 Implementations: attention, residuals and output}
+\begin{center}\includegraphics[width=\linewidth,height=86.4mm,keepaspectratio]{figures/03_residual.pdf}\\{\footnotesize Figure 3. Pre-Norm Transformer block. Teal paths retain the input and intermediate residual; red operations are implemented in the student encoder.}\end{center}
+\subsection*{3.1 Scaled dot-product attention (TODO-03)}
+Compute scores=(Q @ K$^{T}$)/sqrt(64), then apply the supplied softmax helper over the final key axis. Multiplying these coefficients by V yields context [B,12,N,64]. Transpose to [B,N,12,64] and reshape to [B,N,768] before applying the attention output projection. The image path uses causal=False; the supplied optional causal switch is preserved for later text-tower compatibility.
+
+\subsection*{3.2 Residual and MLP calculation (TODO-04)}
+\begin{Verbatim}[fontsize=\footnotesize,breaklines=true,frame=single]
+residual = x + self.attention(self.norm1(x), causal=causal)
+u = self.norm2(residual)
+hidden = self.gelu(u @ self.fc1_weight.T + self.fc1_bias)
+mlp_update = hidden @ self.fc2_weight.T + self.fc2_bias
+return residual + mlp_update
+\end{Verbatim}
+Both residual additions retain [B,N,768]. The MLP expands the feature axis from 768 to 3072, applies exact GELU, and projects back to 768. Each of the 12 blocks uses its own supplied parameters; the blocks do not share learned weights.
+
+\subsection*{3.3 CLS and normalized output (TODO-06)}
+Select tokens[:,0,:], apply post\_norm, then multiply by visual.proj [768,512]. This projection is already stored as [in,out], so it must not be transposed. Finally unit\_vector scales each image row independently. Attention/MLP weights instead use [out,in] and require .T. These distinct layouts are a critical implementation convention.
+
+
+\newpage
+\section*{4 Results and Discussion}
+The supplied checker was rerun for the revised report with python check.py --stage all. Asset integrity and every numerical stage passed. The table reports measured absolute errors, not estimated or fabricated values.
+
+\begin{center}\small\begin{tabular}{lllll}\toprule
+Stage & Shape & Max abs. & Mean abs. & Status\\
+\midrule
+preprocess & (10,3,224,224) & 0 & 0 & PASS\\
+patches & (2,49,3072) & 0 & 0 & PASS\\
+tokens & (2,50,768) & 4.387e-5 & 1.335e-6 & PASS\\
+block0 & (2,50,768) & 7.147e-6 & 3.348e-7 & PASS\\
+last\_tokens & (2,50,768) & 4.196e-5 & 2.633e-6 & PASS\\
+output & (10,512) & 5.662e-7 & 8.688e-8 & PASS\\
+batch & (3,512) & 4.061e-7 & 7.848e-8 & PASS\\
+\bottomrule\end{tabular}\end{center}
+\begin{center}\includegraphics[width=\linewidth,height=39.5mm,keepaspectratio]{figures/04_error_chart.pdf}\\{\footnotesize Figure 4. Maximum absolute error on a logarithmic axis. Exact-zero preprocessing and patch errors are omitted from this log plot.}\end{center}
+\subsection*{4.1 Validation criteria and debugging}
+The checker requires matching shapes, finite float32 arrays, and elementwise error $\leq$ atol + rtol$\times$|reference|, with rtol=2e-4. The absolute tolerances are 2e-6 for preprocessing, 2e-4 for internal stages, and 2e-5 for output/batch. It also checks unit-length output rows. Batch order [1,0,1] tests both reordering and duplicate images.
+
+<font color="\#BB313F">\textbf{Observed bug and fix:}</font> the first implementation divided attention scores by a NumPy float64 square root. In the tested environment this promoted subsequent tensors and caused the checker to reject their dtype. Casting the scale to np.float32(np.sqrt(self.head\_dim)) fixed the dtype failure; all stages then passed. Other risks include a wrong patch transpose, omitted residual addition, and transposing visual.proj.
+
+\subsection*{4.2 Reproduction, limits and assistance}
+Install requirements.txt, then copy the completed image\_encoder.py into the original course project folder. Keep its weights/, assets/ and manifest files intact. Run python check.py --stage all; run python run.py --output output\_tokens.npz to save image IDs and features. Large course weights and reference data are intentionally excluded from the submission. These tests establish agreement on the supplied images and reordered batch; they do not measure recognition accuracy or certify all possible inputs.
+
+\textbf{Assistance disclosure:} ChatGPT assisted with the NumPy implementation, debugging, validation commands, diagrams and report drafting. Supplied course helpers, weights and reference data were retained. Repository: https://github.com/Auga0123/project1-numpy-image-encoder
+
+
+\end{document}
